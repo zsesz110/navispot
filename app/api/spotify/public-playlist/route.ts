@@ -44,12 +44,12 @@ export async function POST(req: NextRequest) {
         404,
       );
     }
-    if (status === 401) {
+    if (status === 502) {
       return err(
         {
           code: 'spotify_error',
-          message: 'Spotify rejected our server credentials. Check SPOTIFY_CLIENT_ID/SECRET.',
-          status: 401,
+          message: e instanceof Error ? e.message : 'Spotify public page is unavailable',
+          status: 502,
         },
         502,
       );
