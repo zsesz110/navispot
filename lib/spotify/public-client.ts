@@ -33,9 +33,11 @@ export function extractPlaylistId(input: string): string | null {
   return null;
 }
 
-class PublicPageError extends Error {
+export class PublicPageError extends Error {
   status = 502;
 }
+
+export class IncompleteEmbedError extends PublicPageError {}
 
 function formatError(detail: string): PublicPageError {
   return new PublicPageError(`Spotify public playlist page format changed or is incomplete: ${detail}`);
@@ -62,7 +64,7 @@ export function parsePublicPlaylistHtml(html: string, playlistId: string): Impor
   // The public embed currently returns at most 100 tracks and has no public
   // pagination. Never claim a capped list is complete.
   if (entity.trackList.length >= EMBED_TRACK_LIMIT) {
-    throw new PublicPageError(
+    throw new IncompleteEmbedError(
       `Spotify's public embed exposes at most ${EMBED_TRACK_LIMIT} tracks. This playlist may contain more; NaviSpot cannot safely import it in full from the public page.`,
     );
   }
@@ -120,5 +122,85 @@ export async function getPublicPlaylist(playlistId: string): Promise<ImportedPla
     throw error;
   }
   if (!response.ok) throw new PublicPageError(`Spotify public page request failed (${response.status})`);
-  return parsePublicPlaylistHtml(await response.text(), playlistId);
+  try {
+    return parsePublicPlaylistHtml(await response.text(), playlistId);
+  } catch (error) {
+    if (error instanceof IncompleteEmbedError) return getBrowserPlaylist(playlistId);
+    throw error;
+  }
+}
+
+interface BrowserWorkerTrack {
+  id: string | null;
+  name: string;
+  artists: string[];
+  album: string;
+  duration_ms: number;
+  url?: string;
+}
+
+interface BrowserWorkerPlaylist {
+  id: string;
+  name: string;
+  owner: string;
+  trackCount: number;
+  imageUrl?: string;
+  tracks: BrowserWorkerTrack[];
+}
+
+async function getBrowserPlaylist(playlistId: string): Promise<ImportedPlaylist> {
+  const workerUrl = process.env.SPOTIFY_BROWSER_WORKER_URL;
+  if (!workerUrl) {
+    throw new PublicPageError('Spotify public embed is incomplete and the browser worker is not configured');
+  }
+  const configuredTimeout = Number(process.env.SPOTIFY_BROWSER_WORKER_TIMEOUT_MS);
+  const timeout = Number.isFinite(configuredTimeout) && configuredTimeout >= 10_000 && configuredTimeout <= 180_000
+    ? configuredTimeout : 75_000;
+  let response: Response;
+  try {
+    response = await fetch(new URL('/playlist', workerUrl), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: `https://open.spotify.com/playlist/${playlistId}` }),
+      signal: AbortSignal.timeout(timeout + 10_000),
+      cache: 'no-store',
+    });
+  } catch (error) {
+    throw new PublicPageError(`Spotify browser worker is unavailable: ${error instanceof Error ? error.message : 'request failed'}`);
+  }
+  if (!response.ok) {
+    const body = await response.json().catch(() => null) as { error?: string } | null;
+    throw new PublicPageError(body?.error || `Spotify browser worker failed (${response.status})`);
+  }
+  const data = await response.json().catch(() => { throw new PublicPageError('Spotify browser worker returned invalid JSON'); }) as BrowserWorkerPlaylist;
+  if (data?.id !== playlistId || typeof data.name !== 'string' || !data.name.trim() ||
+      typeof data.owner !== 'string' || !Number.isSafeInteger(data.trackCount) ||
+      data.trackCount < EMBED_TRACK_LIMIT || !Array.isArray(data.tracks) || data.tracks.length !== data.trackCount ||
+      data.tracks.some((track) => !track || typeof track.name !== 'string' || !track.name.trim() ||
+        typeof track.album !== 'string' || !Array.isArray(track.artists) ||
+        !track.artists.length || track.artists.some((name) => typeof name !== 'string' || !name.trim()) ||
+        !Number.isSafeInteger(track.duration_ms) || track.duration_ms < 0 ||
+        (track.id !== null && !/^[A-Za-z0-9]{22}$/.test(track.id)))) {
+    throw new PublicPageError('Spotify browser worker returned incomplete or invalid playlist metadata');
+  }
+  const tracks: SpotifyTrack[] = data.tracks.map((track) => ({
+    id: track.id,
+    name: track.name,
+    artists: track.artists.map((name) => ({ id: null, name })),
+    album: { id: null, name: track.album || '' },
+    duration_ms: track.duration_ms,
+    external_ids: {},
+    ...(track.id ? { external_urls: { spotify: `https://open.spotify.com/track/${track.id}` } } : {}),
+  }));
+  return {
+    id: playlistId,
+    name: data.name,
+    owner: data.owner || '',
+    trackCount: tracks.length,
+    imageUrl: data.imageUrl,
+    tracks,
+    entries: normalizeEntries(tracks),
+    nullTrackCount: 0,
+    importedAt: new Date().toISOString(),
+  };
 }

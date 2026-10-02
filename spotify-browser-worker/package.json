@@ -1,0 +1,12 @@
+{
+  "name": "navispot-spotify-browser-worker",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test worker.check.cjs"
+  },
+  "dependencies": {
+    "playwright": "1.62.1"
+  }
+}

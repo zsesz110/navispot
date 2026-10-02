@@ -60,7 +60,7 @@
 
 ### Path B: Without Spotify (public playlists only)
 
-> **No Spotify Premium required** — Path B uses the server's Client Credentials flow, which works with any Spotify account (or no account at all) and is powered entirely by the app's own Spotify developer credentials. This is the path to take if you're on a free Spotify account.
+> **No Spotify login, Premium, or API credentials required.** Public playlists are read from Spotify's public pages. Lists beyond the public embed's 100-track limit use the separate browser worker included in Docker Compose.
 
 1. **Enter Navidrome** – Fill in your Navidrome server URL, username, and password
 2. **Click "Continue without Spotify"** on the login page
@@ -97,9 +97,8 @@ Unmatched tracks can be exported as JSON for later addition to Navidrome.
 
 ### Prerequisites
 
-- Node.js 18.17+
-- Spotify Developer account
-- Spotify account — **Premium is only required if you want to export your own personal/private playlists.** Public playlist imports work with a free Spotify account (or no Spotify account at all — only your app's dev-mode keys are used).
+- Node.js 20.9+
+- Spotify Developer account and Spotify login only for personal/private Spotify playlists
 - Running Navidrome instance
 
 ### Local Development
@@ -117,6 +116,8 @@ cp .env.example .env.local
 # Run
 bun dev
 ```
+
+For public playlists of 100 tracks or more during local development, start the separate `spotify-browser-worker` (see its package files) and set `SPOTIFY_BROWSER_WORKER_URL=http://127.0.0.1:8787` in `.env.local`. Docker Compose configures this automatically.
 
 > **Note:** Spotify requires HTTPS for redirect URIs. If you're developing locally, use `bun dev --experimental-https` instead of `bun dev`. This generates a self-signed cert and serves your app over HTTPS at `https://localhost:3000`. You may also need to use your local network address (e.g., `https://192.168.x.x:3000`) and add it as a redirect URI in the Spotify Developer Dashboard.
 
@@ -137,6 +138,8 @@ bun dev
 ```bash
 docker compose up -d
 ```
+
+Compose runs a separate Playwright/Chromium worker for long public playlists. Its port is available only inside the Compose network; the main NaviSpot image does not include Chromium.
 
 **Production Variables:**
 
@@ -203,14 +206,13 @@ We appreciate detailed reports that help us improve NaviSpot for everyone!
 - **Framework:** Next.js 16 (App Router)
 - **Language:** TypeScript
 - **Styling:** Tailwind CSS
-- **APIs:** Spotify Web API (User Auth + Client Credentials), Navidrome Subsonic API
-- **HTTP (server-side):** Node's built-in `https` module for the public-client flow (bypasses `undici` connection timeouts that some environments hit with `fetch`)
+- **APIs:** Spotify Web API (authenticated features), Spotify public pages (public import), Navidrome Subsonic API
+- **Public import:** Static embed metadata with an isolated browser-worker fallback for long playlists
 
 ### Spotify App Configuration Notes
 
 - The app only requests three scopes: `playlist-read-private`, `playlist-read-collaborative`, `user-library-read`. No write scopes.
-- In **Development Mode**, only the app owner and explicitly added users can complete the OAuth flow. The Client Credentials flow (used for public playlist imports) has no such restriction — your dev-mode keys are enough.
-- The public-client server route caches the Client Credentials token in memory for its full 1-hour lifetime, so repeated imports of public playlists don't re-authenticate.
+- In **Development Mode**, authenticated Spotify access remains limited by Spotify's app rules. Public playlist import does not use the app's OAuth or Client Credentials.
 
 ---
 

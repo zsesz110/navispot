@@ -7,8 +7,32 @@ services:
       - "3883:3000"
     environment:
       - NODE_ENV=production
+      - SPOTIFY_BROWSER_WORKER_URL=http://spotify-browser-worker:8787
     env_file:
       - .env.local
+    restart: unless-stopped
+    depends_on:
+      spotify-browser-worker:
+        condition: service_healthy
+
+  spotify-browser-worker:
+    build:
+      context: ./spotify-browser-worker
+      dockerfile: Dockerfile
+    expose:
+      - "8787"
+    environment:
+      - NODE_ENV=production
+      - PORT=8787
+      - BIND_HOST=0.0.0.0
+      - SPOTIFY_BROWSER_WORKER_TIMEOUT_MS=75000
+      - SPOTIFY_BROWSER_PROXY=${SPOTIFY_BROWSER_PROXY:-}
+    shm_size: "1gb"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     restart: unless-stopped
 
   # Optional: Navidrome instance for testing
