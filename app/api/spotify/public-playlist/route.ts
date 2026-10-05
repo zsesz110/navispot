@@ -10,14 +10,14 @@ function err(body: PublicPlaylistError, status: number) {
 }
 
 export async function POST(req: NextRequest) {
-  let body: { url?: string };
+  let body: { url?: unknown } | null;
   try {
-    body = (await req.json()) as { url?: string };
+    body = (await req.json()) as { url?: unknown } | null;
   } catch {
     return err({ code: 'invalid_url', message: 'Invalid JSON body' }, 400);
   }
 
-  const id = extractPlaylistId(body.url ?? '');
+  const id = extractPlaylistId(body?.url);
   if (!id) {
     return err(
       {

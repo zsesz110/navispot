@@ -21,16 +21,22 @@ interface EmbedEntity {
   title?: unknown;
   subtitle?: unknown;
   trackList?: unknown;
+  trackCount?: unknown;
   coverArt?: { sources?: { url?: unknown }[] };
 }
 
-export function extractPlaylistId(input: string): string | null {
+export function extractPlaylistId(input: unknown): string | null {
+  if (typeof input !== 'string') return null;
   const trimmed = input.trim();
-  if (!trimmed) return null;
-  const match = trimmed.match(/playlist\/([A-Za-z0-9]{22})/);
-  if (match) return match[1];
   if (/^[A-Za-z0-9]{22}$/.test(trimmed)) return trimmed;
-  return null;
+  try {
+    const url = new URL(trimmed);
+    if (url.protocol !== 'https:' || url.hostname !== 'open.spotify.com' ||
+        url.port || url.username || url.password || url.hash) return null;
+    return /^\/playlist\/([A-Za-z0-9]{22})\/?$/.exec(url.pathname)?.[1] ?? null;
+  } catch {
+    return null;
+  }
 }
 
 export class PublicPageError extends Error {
@@ -67,6 +73,10 @@ export function parsePublicPlaylistHtml(html: string, playlistId: string): Impor
     throw new IncompleteEmbedError(
       `Spotify's public embed exposes at most ${EMBED_TRACK_LIMIT} tracks. This playlist may contain more; NaviSpot cannot safely import it in full from the public page.`,
     );
+  }
+  if (entity.trackCount !== undefined &&
+      (!Number.isSafeInteger(entity.trackCount) || entity.trackCount !== entity.trackList.length)) {
+    throw new IncompleteEmbedError('Spotify public embed track count does not match its track list');
   }
 
   const tracks: SpotifyTrack[] = entity.trackList.map((item: EmbedTrack, index: number) => {
@@ -111,23 +121,46 @@ export function parsePublicPlaylistHtml(html: string, playlistId: string): Impor
 }
 
 export async function getPublicPlaylist(playlistId: string): Promise<ImportedPlaylist> {
-  const response = await fetch(`https://open.spotify.com/embed/playlist/${playlistId}`, {
-    headers: { 'User-Agent': USER_AGENT, Accept: 'text/html' },
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    cache: 'no-store',
-  });
-  if (response.status === 404) {
-    const error = new Error('Spotify playlist is private or unavailable') as Error & { status: number };
-    error.status = 404;
-    throw error;
+  if (!/^[A-Za-z0-9]{22}$/.test(playlistId)) {
+    throw new PublicPageError('Invalid Spotify playlist ID');
   }
-  if (!response.ok) throw new PublicPageError(`Spotify public page request failed (${response.status})`);
+  let staticReason: string;
   try {
+    const response = await fetch(`https://open.spotify.com/embed/playlist/${playlistId}`, {
+      headers: { 'User-Agent': USER_AGENT, Accept: 'text/html' },
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      cache: 'no-store',
+    });
+    if (!response.ok) throw new PublicPageError(`Spotify public page request failed (HTTP ${response.status})`);
     return parsePublicPlaylistHtml(await response.text(), playlistId);
   } catch (error) {
-    if (error instanceof IncompleteEmbedError) return getBrowserPlaylist(playlistId);
-    throw error;
+    staticReason = safeReason(error);
+    if (error instanceof IncompleteEmbedError) {
+      console.info('[public-playlist] static source incomplete; falling back to browser worker');
+    } else {
+      console.warn(`[public-playlist] static fast path failed; falling back to browser worker: ${staticReason}`);
+    }
   }
+  try {
+    const playlist = await getBrowserPlaylist(playlistId);
+    console.info(`[public-playlist] browser fallback succeeded: ${playlist.trackCount} tracks`);
+    return playlist;
+  } catch (error) {
+    const browserReason = safeReason(error);
+    console.error(`[public-playlist] browser fallback failed: ${browserReason}`);
+    throw new PublicPageError(
+      `Public Spotify playlist import failed. Static source: ${staticReason}. Browser fallback: ${browserReason}.`,
+    );
+  }
+}
+
+function safeReason(error: unknown): string {
+  if (!(error instanceof Error)) return 'unknown error';
+  return (error.message || error.name || 'unknown error')
+    .replace(/https?:\/\/[^\s)]+/gi, '[URL]')
+    .replace(/\b(Bearer|Basic)\s+[^\s,;]+/gi, '$1 [redacted]')
+    .replace(/\b(authorization|cookie|proxy-authorization)\s*[:=]\s*[^\s,;]+/gi, '$1: [redacted]')
+    .slice(0, 300);
 }
 
 interface BrowserWorkerTrack {
@@ -175,7 +208,7 @@ async function getBrowserPlaylist(playlistId: string): Promise<ImportedPlaylist>
   const data = await response.json().catch(() => { throw new PublicPageError('Spotify browser worker returned invalid JSON'); }) as BrowserWorkerPlaylist;
   if (data?.id !== playlistId || typeof data.name !== 'string' || !data.name.trim() ||
       typeof data.owner !== 'string' || !Number.isSafeInteger(data.trackCount) ||
-      data.trackCount < EMBED_TRACK_LIMIT || !Array.isArray(data.tracks) || data.tracks.length !== data.trackCount ||
+      data.trackCount < 1 || !Array.isArray(data.tracks) || data.tracks.length !== data.trackCount ||
       data.tracks.some((track) => !track || typeof track.name !== 'string' || !track.name.trim() ||
         typeof track.album !== 'string' || !Array.isArray(track.artists) ||
         !track.artists.length || track.artists.some((name) => typeof name !== 'string' || !name.trim()) ||

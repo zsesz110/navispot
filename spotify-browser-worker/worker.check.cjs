@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const { JSDOM } = require('jsdom');
 const { extractVisibleRows, parseDuration, normalizeRow, TrackCollector } = require('./dom');
 const { canonicalPlaylistUrl, parseExpectedCount } = require('./validation');
+const { readPage } = require('./collect');
 const { handler, withTimeout, WorkerTimeoutError } = require('./server');
 const http = require('node:http');
 
@@ -54,12 +55,29 @@ test('uses a metadata identity when a public track URL is absent', () => {
 });
 
 test('accepts only public Spotify playlist URLs or IDs', () => {
-  assert.equal(canonicalPlaylistUrl(`https://open.spotify.com/playlist/${id}?si=abc`), `https://open.spotify.com/playlist/${id}`);
-  assert.equal(canonicalPlaylistUrl(id), `https://open.spotify.com/playlist/${id}`);
+  const expected = `https://open.spotify.com/playlist/${id}`;
+  for (const input of [id, expected, `${expected}?si=abc`]) {
+    assert.equal(canonicalPlaylistUrl(input), expected);
+  }
   for (const bad of [`http://open.spotify.com/playlist/${id}`, `https://evil.test/playlist/${id}`,
     `https://open.spotify.com.evil.test/playlist/${id}`, `https://open.spotify.com/track/${id}`,
-    `https://open.spotify.com/playlist/${id}#x`]) assert.throws(() => canonicalPlaylistUrl(bad));
+    `https://open.spotify.com/playlist/${id}#x`, `[${expected}](${expected})`]) {
+    assert.throws(() => canonicalPlaylistUrl(bad));
+  }
   assert.equal(parseExpectedCount('Henry Zheng • 126 songs, about 13 hr'), 126);
+});
+
+test('browser navigation receives only the canonical URL', async () => {
+  const expected = `https://open.spotify.com/playlist/${id}`;
+  for (const input of [id, expected, `${expected}?si=abc`]) {
+    let navigatedTo;
+    const page = { goto: async (url) => { navigatedTo = url; throw new Error('stop before network'); } };
+    await assert.rejects(readPage(page, input, 1000), /stop before network/);
+    assert.equal(navigatedTo, expected);
+  }
+  let called = false;
+  await assert.rejects(readPage({ goto: () => { called = true; } }, `[${expected}](${expected})`, 1000));
+  assert.equal(called, false);
 });
 
 test('HTTP endpoint rejects malformed playlist URLs', async () => {

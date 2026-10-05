@@ -1,9 +1,10 @@
 'use strict';
 const { extractVisibleRows, TrackCollector } = require('./dom');
-const { parseExpectedCount, playlistId } = require('./validation');
+const { canonicalPlaylistUrl, parseExpectedCount, playlistId } = require('./validation');
 
 async function readPage(page, url, timeoutMs) {
-  const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: Math.min(timeoutMs, 30_000) });
+  const targetUrl = canonicalPlaylistUrl(url);
+  const response = await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: Math.min(timeoutMs, 30_000) });
   if (response?.status() === 404) throw new Error('Spotify playlist is private or unavailable');
   if (!response?.ok()) throw new Error(`Spotify public page returned ${response?.status() || 'no response'}`);
   const list = page.locator('[data-testid="playlist-tracklist"]');
@@ -47,7 +48,7 @@ async function readPage(page, url, timeoutMs) {
     throw new Error(`Spotify public page extraction incomplete: expected ${expected} tracks, collected ${collector.size}; scroll attempts ${attempts}; last position ${collector.lastPosition}`);
   }
   return {
-    id: playlistId(url), name, owner, trackCount: expected,
+    id: playlistId(targetUrl), name, owner, trackCount: expected,
     ...(imageUrl?.startsWith('https://') ? { imageUrl } : {}),
     tracks: collector.result(),
   };
