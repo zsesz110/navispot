@@ -1,3 +1,11 @@
+import { canonicalizeChinese } from './chinese-normalize';
+import { canonicalArtistIdentity } from './artist-aliases';
+import { artistIdentities } from './artist-components';
+import { areVerifiedTitleAliases } from './title-aliases';
+import { comparisonTitle, isMedley, medleyComponents, titleVariants } from './title-variants';
+
+export { stripTitleSuffix } from './title-search';
+
 export interface FuzzyMatchOptions {
   threshold?: number;
   songCount?: number;
@@ -18,15 +26,26 @@ export interface FuzzyMatchCandidateResult {
   bestMatch?: FuzzyMatchResult;
 }
 
+export interface TrackScoreDetails {
+  titleSimilarity: number;
+  artistSimilarity: number;
+  albumSimilarity: number;
+  durationSimilarity: number;
+  durationDiffMs: number;
+  versionPenalty: number;
+  finalScore: number;
+  rejectionReason?: string;
+}
+
 export function normalizeString(str: string): string {
-  return str
+  return canonicalizeChinese(str
     .toLowerCase()
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^\w\s]/g, '')
+    .replace(/[^\p{L}\p{N}\p{M}\s]/gu, '')
     .replace(/\s+/g, ' ')
     .trim()
-    .replace(/^(the|a|an)\s+/, '');
+    .replace(/^(the|a|an)\s+/, '')).normalize('NFC');
 }
 
 export function levenshteinDistance(a: string, b: string): number {
@@ -80,7 +99,8 @@ export function calculateArtistSimilarity(
   const normalizedSpotify = normalizeArtistName(spotifyArtist);
   const normalizedNavidrome = normalizeArtistName(navidromeArtist);
 
-  if (normalizedSpotify === normalizedNavidrome) return 1.0;
+  if (!normalizedSpotify || !normalizedNavidrome) return 0;
+  if (canonicalArtistIdentity(normalizedSpotify) === canonicalArtistIdentity(normalizedNavidrome)) return 1.0;
 
   const maxLength = Math.max(normalizedSpotify.length, normalizedNavidrome.length);
   if (maxLength === 0) return 1.0;
@@ -93,16 +113,16 @@ export function calculateBestArtistSimilarity(
   spotifyArtists: string[],
   navidromeArtist: string
 ): number {
+  const localIdentities = artistIdentities([navidromeArtist]);
+  if (artistIdentities(spotifyArtists).some((identity) => localIdentities.includes(identity))) return 1;
   let best = 0;
-  for (const artist of spotifyArtists) {
+  for (const artist of spotifyArtists.flatMap((name) => name.split(/\s*,\s*|\s+&\s+|\s+(?:feat\.?|with)\s+/iu))) {
     const score = calculateArtistSimilarity(artist, navidromeArtist);
     if (score > best) best = score;
     if (best === 1.0) break;
   }
   return best;
 }
-
-const DURATION_THRESHOLD_MS = 3000;
 
 export function calculateDurationSimilarity(
   spotifyDurationMs: number,
@@ -111,13 +131,10 @@ export function calculateDurationSimilarity(
   const navidromeDurationMs = navidromeDurationSeconds * 1000;
   const diff = Math.abs(spotifyDurationMs - navidromeDurationMs);
 
-  if (diff < DURATION_THRESHOLD_MS) {
-    const similarity = 1.0 - (diff / DURATION_THRESHOLD_MS);
-    return Math.max(similarity, 0.9);
-  }
-
-  const penalty = Math.min(diff / 60000, 1);
-  return 1.0 - penalty;
+  if (!Number.isFinite(diff) || spotifyDurationMs <= 0 || navidromeDurationSeconds <= 0) return 0;
+  if (diff <= 5_000) return 1 - diff / 50_000;
+  if (diff <= 15_000) return 0.9 - (diff - 5_000) / 50_000;
+  return Math.max(0, 0.7 - (diff - 15_000) / 85_714.2857);
 }
 
 const SOUNDTRACK_WORDS = [
@@ -125,20 +142,10 @@ const SOUNDTRACK_WORDS = [
   'complete', 'vol', 'volume', ' disc ', 'disk'
 ];
 
-const TITLE_SUFFIX_PATTERN = /[\(\[].*?[\)\]]\s*$|[-–—~/].*$/;
-
-export function stripTitleSuffix(title: string): string {
-  let result = title;
-  let prev = '';
-  while (result !== prev) {
-    prev = result;
-    result = result.replace(TITLE_SUFFIX_PATTERN, '').trim();
-  }
-  return result;
-}
-
 export function normalizeAlbumName(album: string): string {
-  let normalized = album.toLowerCase();
+  let normalized = album.toLowerCase()
+    .replace(/[（(]\s*(?:儿童)?敬拜赞美专辑\s*\d+\s*[）)]/gu, ' ')
+    .replace(/[（(]\s*(?:兒童)?敬拜讚美專輯\s*\d+\s*[）)]/gu, ' ');
   for (const word of SOUNDTRACK_WORDS) {
     normalized = normalized.replace(new RegExp(word, 'gi'), ' ');
   }
@@ -149,11 +156,11 @@ export function normalizeAlbumName(album: string): string {
 const FEATURED_ARTIST_PATTERN = /[\(\[]\s*(?:feat\.?|ft\.?|featuring)\s+[^\)\]]*[\)\]]/gi;
 
 export function normalizeTitle(title: string): string {
-  let normalized = title.toLowerCase();
+  let normalized = title.toLowerCase().replace(/^(?:組曲|组曲)\s*[:：]\s*/u, '');
   // Remove parenthetical/bracket groups containing featured artists
   // e.g. "(feat. Kehlani & Lil Yachty)", "[ft. Someone]"
   normalized = normalized.replace(FEATURED_ARTIST_PATTERN, ' ');
-  normalized = normalizeString(normalized);
+  normalized = normalizeString(comparisonTitle(normalized));
   return normalized.replace(/\s+/g, ' ').trim();
 }
 
@@ -187,7 +194,8 @@ export function calculateAlbumSimilarity(
   if (spotifyParts.length === 0 || navidromeParts.length === 0) return 0;
 
   const matchingParts = spotifyParts.filter(part =>
-    navidromeParts.some(nPart => nPart.includes(part) || part.includes(nPart))
+    navidromeParts.some(nPart => part === nPart ||
+      (Math.min(part.length, nPart.length) >= 3 && (nPart.includes(part) || part.includes(nPart))))
   );
 
   const similarity = matchingParts.length / Math.max(spotifyParts.length, navidromeParts.length);
@@ -198,6 +206,16 @@ export function calculateTitleSimilarity(
   spotifyTitle: string,
   navidromeTitle: string
 ): number {
+  if (isMedley(spotifyTitle) !== isMedley(navidromeTitle)) return 0;
+  if (isMedley(spotifyTitle)) {
+    const left = medleyComponents(spotifyTitle);
+    const right = medleyComponents(navidromeTitle);
+    return left.length === right.length && left.every((part, index) => part === right[index]) ? 1 : 0;
+  }
+  if (areVerifiedTitleAliases(spotifyTitle, navidromeTitle)) return 1;
+  const leftVariants = titleVariants(spotifyTitle).map(normalizeTitle);
+  const rightVariants = titleVariants(navidromeTitle).map(normalizeTitle);
+  if (leftVariants.some((left) => left && rightVariants.includes(left))) return 1;
   const normalizedSpotify = normalizeTitle(spotifyTitle);
   const normalizedNavidrome = normalizeTitle(navidromeTitle);
 
@@ -206,26 +224,33 @@ export function calculateTitleSimilarity(
   }
 
   const maxLength = Math.max(normalizedSpotify.length, normalizedNavidrome.length);
-  if (maxLength === 0) return 1.0;
+  if (maxLength === 0) return 0;
 
   const distance = levenshteinDistance(normalizedSpotify, normalizedNavidrome);
   return 1.0 - distance / maxLength;
 }
 
 const VERSION_KEYWORDS = /\b(?:remix|rmxx|acoustic|instrumental|radio\s*edit|extended|dub|vip|rework|bootleg|karaoke|demo|unplugged|stripped|live|mix|edit|cover)\b/gi;
+const CHINESE_VERSION_KEYWORDS = /伴奏|純音樂|纯音乐|現場|现场|演唱會|演唱会/gu;
+
+function addVersionMarkers(fragment: string, markers: Set<string>): void {
+  for (const match of fragment.match(VERSION_KEYWORDS) ?? []) markers.add(match.toLowerCase());
+  for (const match of fragment.match(CHINESE_VERSION_KEYWORDS) ?? []) {
+    markers.add(/伴奏|音乐|音樂/u.test(match) ? 'instrumental' : 'live');
+  }
+}
 
 export function extractVersionMarkers(title: string): Set<string> {
   const markers = new Set<string>();
   const groups = title.match(/[\(\[][^\)\]]*[\)\]]/g) || [];
   for (const group of groups) {
-    const matches = group.match(VERSION_KEYWORDS);
-    if (matches) matches.forEach(m => markers.add(m.toLowerCase()));
+    addVersionMarkers(group, markers);
   }
+  for (const group of title.match(/[（【][^）】]*[）】]/gu) ?? []) addVersionMarkers(group, markers);
   const dashParts = title.split(/[-–—]/);
   if (dashParts.length > 1) {
     for (let i = 1; i < dashParts.length; i++) {
-      const matches = dashParts[i].match(VERSION_KEYWORDS);
-      if (matches) matches.forEach(m => markers.add(m.toLowerCase()));
+      addVersionMarkers(dashParts[i], markers);
     }
   }
   return markers;
@@ -248,6 +273,13 @@ export function calculateTrackSimilarity(
   spotifyTrack: import('@/types/spotify').SpotifyTrack,
   navidromeSong: import('@/types/navidrome').NavidromeSong
 ): number {
+  return calculateTrackScoreDetails(spotifyTrack, navidromeSong).finalScore;
+}
+
+export function calculateTrackScoreDetails(
+  spotifyTrack: import('@/types/spotify').SpotifyTrack,
+  navidromeSong: import('@/types/navidrome').NavidromeSong
+): TrackScoreDetails {
   const hasSpotifyArtist = spotifyTrack.artists && spotifyTrack.artists.length > 0;
   const hasSpotifyAlbum = spotifyTrack.album && spotifyTrack.album.name && spotifyTrack.album.name.length > 0;
 
@@ -306,24 +338,52 @@ export function calculateTrackSimilarity(
   }
 
   if (durationSimilarity >= 0.9 && (artistSimilarity < 0 || artistSimilarity >= 0.6)) {
-    baseSimilarity = Math.min(baseSimilarity + 0.1, 0.95);
+    baseSimilarity = Math.max(baseSimilarity, Math.min(baseSimilarity + 0.1, 0.95));
   }
 
   if (albumSimilarity >= 0.8 && titleSimilarity >= 0.6 && (artistSimilarity < 0 || artistSimilarity >= 0.6)) {
-    baseSimilarity = Math.min(baseSimilarity + 0.05, 0.95);
+    baseSimilarity = Math.max(baseSimilarity, Math.min(baseSimilarity + 0.05, 0.95));
   }
 
+  let rejectionReason: string | undefined;
   // Artist gate: reject candidates with significantly different artists
   if (artistSimilarity >= 0 && artistSimilarity < 0.6) {
     baseSimilarity = Math.min(baseSimilarity, 0.5);
+    rejectionReason = 'artist mismatch';
+  }
+
+  if (isMedley(spotifyTrack.name) !== isMedley(navidromeSong.title)) {
+    baseSimilarity = Math.min(baseSimilarity, 0.5);
+    rejectionReason = 'medley mismatch';
+  }
+  if (isMedley(spotifyTrack.name) && isMedley(navidromeSong.title) && titleSimilarity === 0) {
+    baseSimilarity = Math.min(baseSimilarity, 0.5);
+    rejectionReason = 'medley component mismatch';
+  }
+  if (/(?:演奏专辑|演奏專輯|伴奏|伴唱曲)/u.test(navidromeSong.album) &&
+      !/(?:演奏专辑|演奏專輯|伴奏|伴唱曲)/u.test(spotifyTrack.album?.name ?? '')) {
+    baseSimilarity = Math.min(baseSimilarity, 0.5);
+    rejectionReason = 'instrumental album mismatch';
+  }
+  if (/\blive\b|現場|现场/iu.test(spotifyTrack.album?.name ?? '') &&
+      !/\blive\b|現場|现场/iu.test(navidromeSong.album)) {
+    baseSimilarity = Math.min(baseSimilarity, 0.5);
+    rejectionReason = 'live album mismatch';
   }
 
   // Version mismatch penalty: reject different versions (remix vs original, live vs original, etc.)
+  let versionPenalty = 0;
   if (hasVersionMismatch(spotifyTrack.name, navidromeSong.title)) {
+    versionPenalty = Math.max(0, baseSimilarity - 0.5);
     baseSimilarity = Math.min(baseSimilarity, 0.5);
+    rejectionReason = 'version mismatch';
   }
 
-  return baseSimilarity;
+  return {
+    titleSimilarity, artistSimilarity, albumSimilarity, durationSimilarity,
+    durationDiffMs: Math.abs(spotifyTrack.duration_ms - navidromeSong.duration * 1000),
+    versionPenalty, finalScore: baseSimilarity, rejectionReason,
+  };
 }
 
 export function findBestMatch(
@@ -366,7 +426,11 @@ export function findBestMatch(
   // When all top candidates are the same song (duplicates), it's not truly ambiguous
   const firstMatch = thresholdMatches[0];
   const allSameSong = thresholdMatches.length > 1 && thresholdMatches.every(
-    (m) => m.song.title === firstMatch.song.title && m.song.artist === firstMatch.song.artist
+    (m) => normalizeTitle(m.song.title) === normalizeTitle(firstMatch.song.title) &&
+      canonicalArtistIdentity(normalizeArtistName(m.song.artist)) ===
+        canonicalArtistIdentity(normalizeArtistName(firstMatch.song.artist)) &&
+      normalizeAlbumName(m.song.album) === normalizeAlbumName(firstMatch.song.album) &&
+      Math.abs(m.song.duration - firstMatch.song.duration) <= 5
   );
 
   const hasAmbiguous = thresholdMatches.length > 1 && !allSameSong;

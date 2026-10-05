@@ -3,7 +3,12 @@ import { NavidromeSong, NavidromeNativeSong } from '@/types/navidrome';
 import { TrackMatch, MatchStrategy, MatchStatus } from '@/types/matching';
 import { NavidromeApiClient } from '@/lib/navidrome/client';
 import { matchByStrict } from './strict-matcher';
-import { findBestMatch, normalizeTitle, normalizeArtistName } from './fuzzy';
+import { findBestMatch, normalizeTitle, normalizeArtistName, calculateTrackScoreDetails } from './fuzzy';
+import { canonicalArtistIdentity } from './artist-aliases';
+import { canonicalizeChinese } from './chinese-normalize';
+import { titleSearchQueries } from './title-search';
+import { verifiedTitleAliases } from './title-aliases';
+import { isMedley } from './title-variants';
 import { trackKey as getTrackKey } from '@/lib/spotify/track-identity';
 
 export interface MatchingOrchestratorOptions {
@@ -49,6 +54,15 @@ export function convertNativeSongToNavidromeSong(nativeSong: NavidromeNativeSong
   };
 }
 
+function matchDebugEnabled(): boolean {
+  if (process.env.NAVISPOT_MATCH_DEBUG === 'true') return true;
+  try {
+    return typeof window !== 'undefined' && window.localStorage.getItem('NAVISPOT_MATCH_DEBUG') === 'true';
+  } catch {
+    return false;
+  }
+}
+
 export async function matchTrack(
   client: NavidromeApiClient,
   spotifyTrack: SpotifyTrack,
@@ -85,19 +99,44 @@ export async function matchTrack(
 
   nativeCandidates = await client.searchByTitle(trackTitle, opts.maxSearchResults, signal);
 
-  if (nativeCandidates.length > 50 && spotifyTrack.artists?.length > 0) {
-    const narrowed = await client.searchByTitleAndArtist(
-      trackTitle,
-      spotifyTrack.artists[0].name,
-      opts.maxSearchResults,
-      signal,
-    );
-    if (narrowed.length > 0) {
-      nativeCandidates = narrowed;
+  // Only known semantic artist identities can scope a cross-language fallback.
+  // Duration narrows retrieval; verified title evidence is still required to match.
+  if (nativeCandidates.length === 0 && !isMedley(trackTitle)) {
+    const artistNames = spotifyTrack.artists.map((artist) => artist.name);
+    const catalogName = artistNames.some((name) => canonicalArtistIdentity(name) === 'stream-of-praise')
+      ? '赞美之泉音乐事工'
+      : artistNames.some((name) => canonicalArtistIdentity(name) === 'joshua-band')
+        ? '约书亚乐团' : null;
+    if (catalogName) {
+      const aliases = verifiedTitleAliases(trackTitle);
+      const artistSongs = await client.getCachedSongsByExactArtist(catalogName, signal);
+      nativeCandidates = artistSongs.filter((song) =>
+        Math.abs(song.duration - spotifyTrack.duration_ms / 1000) <= 8 &&
+        aliases.some((alias) => normalizeTitle(alias) === normalizeTitle(song.title)));
     }
   }
 
   candidates = nativeCandidates.map(convertNativeSongToNavidromeSong);
+
+  const finish = (match: TrackMatch): TrackMatch => {
+    if (matchDebugEnabled()) {
+      console.debug('[matching]', {
+        spotify: { title: spotifyTrack.name, artists: spotifyTrack.artists.map((a) => a.name),
+          album: spotifyTrack.album?.name, durationMs: spotifyTrack.duration_ms },
+        search: { originalQuery: trackTitle, normalizedQuery: canonicalizeChinese(trackTitle),
+          queries: titleSearchQueries(trackTitle), candidateCount: candidates.length },
+        candidates: candidates.map((song) => {
+          const scores = calculateTrackScoreDetails(spotifyTrack, song);
+          return { title: song.title, artist: song.artist, album: song.album, duration: song.duration,
+            scores, rejectionReason: scores.rejectionReason ??
+              (scores.finalScore < opts.fuzzyThreshold ? 'below threshold' : undefined) };
+        }),
+        result: { status: match.status, strategy: match.matchStrategy, score: match.matchScore,
+          songId: match.navidromeSong?.id },
+      });
+    }
+    return match;
+  };
 
   const spotifyDurationSec = spotifyTrack.duration_ms / 1000;
 
@@ -106,14 +145,14 @@ export async function matchTrack(
     const isrcMatch = candidates.find((song) => song.isrc?.includes(isrc));
 
     if (isrcMatch) {
-      return {
+      return finish({
         spotifyTrack,
         navidromeSong: isrcMatch,
         matchStrategy: 'isrc',
         matchScore: 1,
         status: 'matched',
         trackKey: trackTk,
-      };
+      });
     }
 
     const normalizedSpotifyTitle = normalizeTitle(spotifyTrack.name);
@@ -124,9 +163,12 @@ export async function matchTrack(
     const variantMatches = candidates.filter((song) => {
       if (normalizeTitle(song.title) !== normalizedSpotifyTitle) return false;
 
-      const songArtist = normalizeArtistName(song.artist);
+      const songArtist = canonicalArtistIdentity(normalizeArtistName(song.artist));
       const artistOverlaps = normalizedSpotifyArtists.some(
-        (a) => a === songArtist || songArtist.includes(a) || a.includes(songArtist)
+        (a) => {
+          const identity = canonicalArtistIdentity(a);
+          return identity === songArtist || songArtist.includes(identity) || identity.includes(songArtist);
+        }
       );
       if (!artistOverlaps) return false;
 
@@ -139,14 +181,14 @@ export async function matchTrack(
       );
 
       if (variantMatches.length === 1 || allSameSong) {
-        return {
+        return finish({
           spotifyTrack,
           navidromeSong: variantMatches[0],
           matchStrategy: 'isrc',
           matchScore: 1,
           status: 'matched',
           trackKey: trackTk,
-        };
+        });
       }
     }
   }
@@ -164,7 +206,7 @@ export async function matchTrack(
     strategyResults.push(matchResult);
 
     if (fuzzyResult.bestMatch && !fuzzyResult.hasAmbiguous) {
-      return {
+      return finish({
         spotifyTrack,
         navidromeSong: fuzzyResult.bestMatch.song,
         matchStrategy: 'fuzzy',
@@ -172,29 +214,29 @@ export async function matchTrack(
         status: 'matched',
         candidates: fuzzyResult.matches.map((m) => m.song),
         trackKey: trackTk,
-      };
+      });
     }
   }
 
   if (opts.enableStrict) {
-    const strictResult = await matchByStrict(client, spotifyTrack, undefined, signal);
+    const strictResult = await matchByStrict(client, spotifyTrack, nativeCandidates, signal);
     strategyResults.push({
       strategy: 'strict',
       matched: strictResult.status === 'matched',
-      ambiguous: false,
+      ambiguous: strictResult.status === 'ambiguous',
       navidromeSong: strictResult.navidromeSong,
       score: strictResult.matchScore,
     });
 
     if (strictResult.status === 'matched') {
-      return {
+      return finish({
         spotifyTrack,
         navidromeSong: strictResult.navidromeSong,
         matchStrategy: 'strict',
         matchScore: 1,
         status: 'matched',
         trackKey: trackTk,
-      };
+      });
     }
   }
 
@@ -204,7 +246,7 @@ export async function matchTrack(
     { score: -1 } as MatchingStrategyResult
   );
 
-  return {
+  return finish({
     spotifyTrack,
     navidromeSong: bestResult.navidromeSong,
     matchStrategy: bestResult.strategy,
@@ -212,7 +254,7 @@ export async function matchTrack(
     status: hasAmbiguous ? 'ambiguous' : 'unmatched',
     candidates: bestResult.candidates,
     trackKey: trackTk,
-  };
+  });
 }
 
 export async function matchTracks(

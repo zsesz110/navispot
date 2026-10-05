@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { filterStrictMatches } from '@/lib/matching/strict-matcher';
+import { filterStrictMatches, matchByStrict, normalizeString } from '@/lib/matching/strict-matcher';
 import { NavidromeNativeSong } from '@/types/navidrome';
+import { NavidromeApiClient } from '@/lib/navidrome/client';
+import type { SpotifyTrack } from '@/types/spotify';
 
 const song1: NavidromeNativeSong = {
   id: 's1',
@@ -33,6 +35,9 @@ const song3: NavidromeNativeSong = {
 };
 
 describe('filterStrictMatches', () => {
+  it('preserves Chinese characters in strict normalization', () => {
+    expect(normalizeString('基督是我滿足')).toBe('基督是我满足');
+  });
   it('matches exact artist and title', () => {
     const result = filterStrictMatches([song1, song2], 'test artist', 'test song');
     expect(result).toHaveLength(1);
@@ -47,6 +52,35 @@ describe('filterStrictMatches', () => {
   it('returns empty for no title match', () => {
     const result = filterStrictMatches([song1], 'test artist', 'wrong title');
     expect(result).toHaveLength(0);
+  });
+});
+
+describe('Chinese artist aliases and duration in strict matching', () => {
+  const spotify: SpotifyTrack = {
+    id: null, name: '基督是我滿足', artists: [{ id: null, name: 'Joshua Band' }],
+    album: { id: null, name: '點燃' }, duration_ms: 315000, external_ids: {},
+  };
+  const correct: NavidromeNativeSong = { ...song1, id: 'correct', title: '基督是我满足',
+    artist: '约书亚乐团', album: '点燃', duration: 318 };
+  const wrong: NavidromeNativeSong = { ...song2, id: 'wrong', title: '基督是我满足',
+    artist: '起初音乐', album: '信徒喜欢的诗歌', duration: 241 };
+
+  it('accepts the declared alias and rejects another same-title artist', () => {
+    expect(filterStrictMatches([correct, wrong], 'joshua band', '基督是我满足')).toEqual([correct]);
+  });
+
+  it('rejects a wrong-duration recording even with the correct alias', async () => {
+    const offDuration = { ...correct, duration: 241 };
+    const client = {} as NavidromeApiClient;
+    const result = await matchByStrict(client, spotify, [offDuration, wrong]);
+    expect(result.status).toBe('unmatched');
+  });
+
+  it('accepts the 3-second duration difference', async () => {
+    const client = {} as NavidromeApiClient;
+    const result = await matchByStrict(client, spotify, [wrong, correct]);
+    expect(result.status).toBe('matched');
+    expect(result.navidromeSong?.id).toBe('correct');
   });
 });
 

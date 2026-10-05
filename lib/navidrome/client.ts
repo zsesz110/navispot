@@ -5,7 +5,8 @@ import {
   SearchOptions,
   NavidromeSearchResponse,
 } from '../../types/navidrome';
-import { stripTitleSuffix } from '@/lib/matching/fuzzy';
+import { stripTitleSuffix, titleSearchQueries } from '@/lib/matching/title-search';
+import { canonicalizeChinese } from '@/lib/matching/chinese-normalize';
 
 export interface ExportMetadata {
   spotifyPlaylistId: string;
@@ -22,14 +23,14 @@ export function generateAuthHeader(username: string, password: string): string {
 }
 
 export function normalizeSearchQuery(query: string): string {
-  return query
+  return canonicalizeChinese(query
     .toLowerCase()
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .replace(/[''`´']/g, '')  // Remove various apostrophe characters
-    .replace(/[^a-z0-9\s]/g, ' ')  // Replace special chars with spaces
+    .replace(/[^\p{L}\p{N}\p{M}\s]/gu, ' ')  // Keep Unicode letters and numbers
     .replace(/\s+/g, ' ')
-    .trim();
+    .trim());
 }
 
 export function parseExportMetadata(comment: string | undefined): ExportMetadata | null {
@@ -514,27 +515,50 @@ export class NavidromeApiClient {
     return this.searchByQuery('', { artistId });
   }
 
-  async searchByTitle(title: string, limit?: number, signal?: AbortSignal): Promise<NavidromeNativeSong[]> {
-    const end = limit || 50;
+  private artistSongCache = new Map<string, Promise<NavidromeNativeSong[]>>();
 
-    const strippedTitle = stripTitleSuffix(title);
-    let songs = await this.searchByQuery('', { title: strippedTitle, _start: 0, _end: end }, signal);
-
-    if (songs.length === 0 && title !== strippedTitle) {
-      songs = await this.searchByQuery('', { title, _start: 0, _end: end }, signal);
-    }
-
-    if (songs.length === 0 && title.includes('/')) {
-      const parts = title.split('/').map(p => p.trim()).filter(p => p.length > 0);
-      for (const part of parts) {
-        const partSongs = await this.searchByQuery('', { title: part, _start: 0, _end: end }, signal);
-        if (partSongs.length > 0) {
-          return partSongs;
+  async getCachedSongsByExactArtist(name: string, signal?: AbortSignal): Promise<NavidromeNativeSong[]> {
+    if (!this.artistSongCache.has(name)) {
+      const request = (async () => {
+        const result = await this._makeNativeRequest<{ items: NavidromeNativeArtist[] } | NavidromeNativeArtist[]>(
+          '/api/artist', { name, _start: 0, _end: 10 }, signal,
+        );
+        const artists = Array.isArray(result) ? result : result.items ?? [];
+        const artist = artists.find((item) => item.name === name);
+        if (!artist || artist.name !== name) return [];
+        const songs: NavidromeNativeSong[] = [];
+        for (let start = 0; start < 2000; start += 500) {
+          const response = await this._makeNativeRequest<NavidromeSearchResponse | NavidromeNativeSong[]>(
+            '/api/song', { artist_id: artist.id, _start: start, _end: start + 500 }, signal,
+          );
+          const page = Array.isArray(response) ? response : response.items ?? [];
+          songs.push(...page);
+          if (page.length < 500) break;
         }
+        return songs;
+      })();
+      this.artistSongCache.set(name, request);
+      request.catch(() => this.artistSongCache.delete(name));
+    }
+    return this.artistSongCache.get(name)!;
+  }
+
+  async searchByTitle(title: string, limit?: number, signal?: AbortSignal): Promise<NavidromeNativeSong[]> {
+    const maxResults = Math.min(Math.max(limit ?? 50, 1), 500);
+    const perQueryLimit = Math.min(maxResults, 250);
+    const queries = titleSearchQueries(title);
+    const songs = new Map<string, NavidromeNativeSong>();
+    for (const query of new Set(queries)) {
+      if (songs.size >= maxResults) break;
+      const response = await this._makeNativeRequest<NavidromeSearchResponse | NavidromeNativeSong[]>(
+        '/api/song', { title: query, _start: 0, _end: Math.min(perQueryLimit, maxResults - songs.size) }, signal,
+      );
+      const page = Array.isArray(response) ? response : response.items ?? [];
+      for (const song of page) {
+        if (song.id && !songs.has(song.id)) songs.set(song.id, song);
       }
     }
-
-    return songs;
+    return [...songs.values()];
   }
 
   async searchByTitleAndArtist(title: string, artistName: string, limit?: number, signal?: AbortSignal): Promise<NavidromeNativeSong[]> {
